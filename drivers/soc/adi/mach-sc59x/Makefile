@@ -3,3 +3,4 @@
 # todo modularize with kconfigs
 
 obj-y := core.o
+obj-$(CONFIG_ADI_SC59X_SMPU) += smpu.o

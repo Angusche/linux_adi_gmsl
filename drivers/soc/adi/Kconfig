@@ -16,3 +16,11 @@ config ADI_PADS_SYSTEM
 	help
 	  This enables support for the ADI PADS System Config driver,
 	  which manages pin configuration and other system settings.
+
+config ADI_SC59X_SMPU
+	tristate "ADI SC59x System Memory Protection Unit"
+	depends on ARCH_SC59X_64 || COMPILE_TEST
+	default ARCH_SC59X_64
+	help
+	  This enables support for the SMPU (System Memory Protection Unit)
+	  on Analog Devices SC59x processors (SC595/SC596/SC598).
