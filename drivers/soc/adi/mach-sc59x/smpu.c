@@ -420,9 +420,9 @@ static void adi_smpu_reset_instance(struct adi_smpu_instance *inst)
 	/* Clear any pending violations */
 	adi_smpu_writel(inst, ADI_SMPU_STAT_W1C_MASK, ADI_SMPU_REG_STAT);
 
-	/* Enable violation interrupts */
+	/* Leave violation interrupts disabled until an IRQ is registered. */
 	val = adi_smpu_readl(inst, ADI_SMPU_REG_CTL);
-	val |= ADI_SMPU_CTL_PINTEN;
+	val &= ~ADI_SMPU_CTL_PINTEN;
 	adi_smpu_writel(inst, val, ADI_SMPU_REG_CTL);
 
 	spin_unlock_irqrestore(&inst->lock, flags);
@@ -1210,14 +1210,16 @@ static int adi_smpu_probe(struct platform_device *pdev)
 		}
 
 		base = devm_ioremap(dev, res->start, resource_size(res));
-		if (IS_ERR(base)) {
+		if (!base) {
 			dev_err(dev, "Failed to map %s\n", name);
-			return PTR_ERR(base);
+			return -ENOMEM;
 		}
 
 		inst->base = base;
 		inst->instance_id = instance_id;
 		inst->name = devm_kasprintf(dev, GFP_KERNEL, "smpu%d", instance_id);
+		if (!inst->name)
+			return -ENOMEM;
 		inst->smpu = smpu;
 		inst->region_bitmap = 0;
 		inst->viol_head = 0;
@@ -1266,7 +1268,10 @@ static int adi_smpu_probe(struct platform_device *pdev)
 	}
 
 	/* Request IRQ for violations (shared across all instances) */
-	irq = platform_get_irq(pdev, 0);
+	irq = platform_get_irq_optional(pdev, 0);
+	if (irq < 0 && irq != -ENXIO)
+		return irq;
+
 	if (irq > 0) {
 		ret = devm_request_irq(dev, irq, adi_smpu_irq_handler,
 				       IRQF_SHARED, dev_name(dev), smpu);
@@ -1274,6 +1279,15 @@ static int adi_smpu_probe(struct platform_device *pdev)
 			dev_err(dev, "Failed to request IRQ %d: %d\n", irq, ret);
 			return ret;
 		}
+
+		for (i = 0; i < smpu->num_instances; i++) {
+			struct adi_smpu_instance *inst = &smpu->instances[i];
+			u32 val = adi_smpu_readl(inst, ADI_SMPU_REG_CTL);
+
+			val |= ADI_SMPU_CTL_PINTEN;
+			adi_smpu_writel(inst, val, ADI_SMPU_REG_CTL);
+		}
+
 		dev_info(dev, "Registered IRQ %d for violations\n", irq);
 	} else {
 		dev_warn(dev, "No IRQ specified, violations will not be reported\n");
