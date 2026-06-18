@@ -43,7 +43,10 @@ enum ad9910_channel {
 	AD9910_CHANNEL_PROFILE_5 = 106,
 	AD9910_CHANNEL_PROFILE_6 = 107,
 	AD9910_CHANNEL_PROFILE_7 = 108,
-	AD9910_CHANNEL_PARALLEL_PORT = 110,
+	AD9910_CHANNEL_PARALLEL_AMP = 110,
+	AD9910_CHANNEL_PARALLEL_PHASE = 111,
+	AD9910_CHANNEL_PARALLEL_FREQ = 112,
+	AD9910_CHANNEL_PARALLEL_POLAR = 113,
 	AD9910_CHANNEL_DRG = 120,
 	AD9910_CHANNEL_DRG_RAMP_UP = 121,
 	AD9910_CHANNEL_DRG_RAMP_DOWN = 122,
@@ -138,18 +141,14 @@ struct ad9910_ram_fw {
 
 /**
  * struct ad9910_backend_ops - AD9910 Backend operations
- * @profile_set:	Set the active profile acting on the PROFILE[2:0] pins
  * @io_update:		Trigger an IO Update
  * @drg_oper_mode_set:	Set the DRG Operating Mode. Backend may implement custom
  *			DRCTL control based on the DRG operating mode.
- * @powerdown_set:	Set the Powerdown state
  */
 struct ad9910_backend_ops {
-	int (*profile_set)(struct iio_backend *back, unsigned int profile);
 	int (*io_update)(struct iio_backend *back);
 	int (*drg_oper_mode_set)(struct iio_backend *back,
 				 enum ad9910_drg_oper_mode mode);
-	int (*powerdown_set)(struct iio_backend *back, unsigned int enable);
 };
 
 /**

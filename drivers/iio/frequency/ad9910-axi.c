@@ -6,6 +6,7 @@
  */
 
 #include <linux/cleanup.h>
+#include <linux/kstrtox.h>
 #include <linux/mod_devicetable.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
@@ -27,13 +28,14 @@
 #define AD9910_AXI_REG_DRG		0x084
 #define AD9910_AXI_REG_PROFILE		0x088
 #define AD9910_AXI_REG_IO_UPDATE	0x08C
+#define AD9910_AXI_REG_RAMP_CFG		0x090
 #define AD9910_AXI_REG_RAMP_DELAY_BST	0x094
-#define AD9910_AXI_REG_RAMP_DELAY_ALR	0x098
+#define AD9910_AXI_REG_RAMP_PERIOD	0x098
 #define AD9910_AXI_REG_BURST_DELAY	0x09C
 #define AD9910_AXI_REG_BURST_COUNT	0x0A0
 #define AD9910_AXI_REG_UPDATE_CTRL	0x104
 #define AD9910_AXI_REG_PAR_RATE		0x108
-#define AD9910_AXI_REG_DMA_CFG		0x10C
+#define AD9910_AXI_REG_F_CFG		0x10C
 
 #define AD9910_AXI_REG_RESET_CORE_MSK		BIT(0)
 #define AD9910_AXI_REG_RESET_IO_MSK		BIT(1)
@@ -44,24 +46,25 @@
 #define AD9910_AXI_REG_DRG_TOGGLE_EN_MSK	BIT(3)
 #define AD9910_AXI_REG_DRG_OPER_MODE_MSK	GENMASK(5, 4)
 
+#define AD9910_AXI_REG_RAMP_CFG_ONE_SHOT_MSK	GENMASK(1, 0)
+#define AD9910_AXI_REG_RAMP_PERIOD_MSK		GENMASK(23, 0)
+#define AD9910_AXI_REG_BURST_COUNT_MSK		GENMASK(19, 0)
+
 #define AD9910_AXI_REG_UPDATE_RATE_MSK		BIT(0)
 #define AD9910_AXI_REG_UPDATE_PAR_IF_EN_MSK	BIT(1)
+#define AD9910_AXI_REG_UPDATE_EXT_TRIG_MSK	BIT(2)
 
 #define AD9910_AXI_REG_PROFILE_MSK		GENMASK(2, 0)
 #define AD9910_AXI_REG_IO_UPDATE_MSK		BIT(0)
-#define AD9910_AXI_REG_DMA_CFG_MSK		GENMASK(1, 0)
+#define AD9910_AXI_REG_F_CFG_MSK		GENMASK(1, 0)
 
-#define AD9910_AXI_PD_CLK_DEFAULT_FREQ_HZ	(250 * HZ_PER_MHZ)
-#define AD9910_AXI_PAR_RATE_MAX			U32_MAX
-
-#define AD9910_AXI_RAMP_DELAY_OFFSET		2
-#define AD9910_AXI_BURST_DELAY_OFFSET		3
+#define AD9910_AXI_PD_CLK_DEFAULT_FREQ_UHZ	(250ULL * HZ_PER_MHZ * MICROHZ_PER_HZ)
+#define AD9910_AXI_PAR_RATE_MAX			U16_MAX
+#define AD9910_AXI_ONE_SHOT_BURST		1
 
 enum {
 	AD9910_AXI_PP_SAMPLE_RATE,
-	AD9910_AXI_DRG_CONTROL_EN,
-	AD9910_AXI_DRG_TOGGLE_EN,
-	AD9910_AXI_DRG_RAMP_DELAY,
+	AD9910_AXI_DRG_RAMP_FREQUENCY,
 	AD9910_AXI_DRG_BURST_COUNT,
 	AD9910_AXI_DRG_BURST_DELAY,
 };
@@ -75,7 +78,7 @@ struct ad9910_axi_state {
 	 * data/variables.
 	 */
 	struct mutex lock;
-	u32 pd_clk_freq_hz;
+	u64 pd_clk_freq_uhz;
 };
 
 #define ad9910_axi_from_rst_ctrl(st)	\
@@ -84,9 +87,26 @@ struct ad9910_axi_state {
 static int ad9910_axi_chan_enable(struct iio_backend *back, unsigned int chan)
 {
 	struct ad9910_axi_state *st = iio_backend_get_priv(back);
+	int ret;
+
+	guard(mutex)(&st->lock);
 
 	switch (chan) {
-	case AD9910_CHANNEL_PARALLEL_PORT:
+	case AD9910_CHANNEL_PHY:
+		return regmap_clear_bits(st->regmap, AD9910_AXI_REG_RESET,
+					 AD9910_AXI_REG_RESET_PW_DOWN_MSK);
+	case AD9910_CHANNEL_PROFILE_0 ... AD9910_CHANNEL_PROFILE_7:
+		chan -= AD9910_CHANNEL_PROFILE_0;
+		return regmap_update_bits(st->regmap, AD9910_AXI_REG_PROFILE,
+					  AD9910_AXI_REG_PROFILE_MSK,
+					  FIELD_PREP(AD9910_AXI_REG_PROFILE_MSK, chan));
+	case AD9910_CHANNEL_PARALLEL_AMP ... AD9910_CHANNEL_PARALLEL_POLAR:
+		chan -= AD9910_CHANNEL_PARALLEL_AMP;
+		ret = regmap_update_bits(st->regmap, AD9910_AXI_REG_F_CFG,
+					 AD9910_AXI_REG_F_CFG_MSK, chan);
+		if (ret)
+			return ret;
+
 		return regmap_set_bits(st->regmap, AD9910_AXI_REG_UPDATE_CTRL,
 				       AD9910_AXI_REG_UPDATE_PAR_IF_EN_MSK);
 	default:
@@ -98,8 +118,13 @@ static int ad9910_axi_chan_disable(struct iio_backend *back, unsigned int chan)
 {
 	struct ad9910_axi_state *st = iio_backend_get_priv(back);
 
+	guard(mutex)(&st->lock);
+
 	switch (chan) {
-	case AD9910_CHANNEL_PARALLEL_PORT:
+	case AD9910_CHANNEL_PHY:
+		return regmap_set_bits(st->regmap, AD9910_AXI_REG_RESET,
+				       AD9910_AXI_REG_RESET_PW_DOWN_MSK);
+	case AD9910_CHANNEL_PARALLEL_AMP ... AD9910_CHANNEL_PARALLEL_POLAR:
 		return regmap_clear_bits(st->regmap, AD9910_AXI_REG_UPDATE_CTRL,
 					 AD9910_AXI_REG_UPDATE_PAR_IF_EN_MSK);
 	default:
@@ -131,24 +156,22 @@ static int ad9910_axi_ext_info_set(struct iio_backend *back, uintptr_t private,
 				   const char *buf, size_t len)
 {
 	struct ad9910_axi_state *st = iio_backend_get_priv(back);
-	int val, val2, ret;
 	u32 tmp32;
 	u64 tmp64;
+	int ret;
 
 	guard(mutex)(&st->lock);
 
 	switch (private) {
 	case AD9910_AXI_PP_SAMPLE_RATE:
-		ret = iio_str_to_fixpoint(buf, MICRO/10, &val, &val2);
+		ret = kstrtoudec64(buf, 6, &tmp64);
 		if (ret)
 			return ret;
 
-		tmp64 = (u64)val * MICRO + val2;
 		if (!tmp64)
 			return -EINVAL;
 
-		tmp64 = DIV64_U64_ROUND_CLOSEST((u64)st->pd_clk_freq_hz * MICRO,
-						 tmp64);
+		tmp64 = DIV64_U64_ROUND_CLOSEST(st->pd_clk_freq_uhz, tmp64);
 		tmp32 = clamp(tmp64, 1U, AD9910_AXI_PAR_RATE_MAX);
 		ret = regmap_write(st->regmap, AD9910_AXI_REG_PAR_RATE, tmp32 - 1);
 		if (ret)
@@ -157,53 +180,53 @@ static int ad9910_axi_ext_info_set(struct iio_backend *back, uintptr_t private,
 		ret = regmap_set_bits(st->regmap, AD9910_AXI_REG_UPDATE_CTRL,
 				      AD9910_AXI_REG_UPDATE_RATE_MSK);
 		break;
-	case AD9910_AXI_DRG_CONTROL_EN:
-		ret = kstrtou32(buf, 10, &tmp32);
+	case AD9910_AXI_DRG_RAMP_FREQUENCY:
+		ret = kstrtoudec64(buf, 6, &tmp64);
 		if (ret)
 			return ret;
 
-		tmp32 = tmp32 ? AD9910_AXI_REG_DRG_DRCTL_MSK : 0;
-		ret = regmap_update_bits(st->regmap, AD9910_AXI_REG_DRG,
-					 AD9910_AXI_REG_DRG_DRCTL_MSK, tmp32);
-		break;
-	case AD9910_AXI_DRG_TOGGLE_EN:
-		ret = kstrtou32(buf, 10, &tmp32);
-		if (ret)
-			return ret;
+		if (!tmp64) {
+			ret = regmap_clear_bits(st->regmap, AD9910_AXI_REG_DRG,
+						AD9910_AXI_REG_DRG_TOGGLE_EN_MSK);
+			break;
+		}
 
-		tmp32 = tmp32 ? AD9910_AXI_REG_DRG_TOGGLE_EN_MSK : 0;
-		ret = regmap_update_bits(st->regmap, AD9910_AXI_REG_DRG,
-					 AD9910_AXI_REG_DRG_TOGGLE_EN_MSK, tmp32);
-		break;
-	case AD9910_AXI_DRG_RAMP_DELAY:
-		ret = iio_str_to_fixpoint(buf, NANO / 10, &val, &val2);
-		if (ret)
-			return ret;
+		ret = regmap_set_bits(st->regmap, AD9910_AXI_REG_DRG,
+				      AD9910_AXI_REG_DRG_TOGGLE_EN_MSK);
 
-		tmp64 = (u64)val * NANO + val2;
-		tmp64 = mul_u64_u32_div(tmp64, st->pd_clk_freq_hz, NANO);
-		tmp64 = max(tmp64, AD9910_AXI_RAMP_DELAY_OFFSET);
-		tmp64 -= AD9910_AXI_RAMP_DELAY_OFFSET;
-		tmp32 = min(tmp64, U32_MAX);
-		ret = regmap_write(st->regmap, AD9910_AXI_REG_RAMP_DELAY_ALR, tmp32);
+		tmp64 = DIV64_U64_ROUND_CLOSEST(st->pd_clk_freq_uhz, tmp64);
+		tmp32 = clamp_t(u32, tmp64, 2U, FIELD_MAX(AD9910_AXI_REG_RAMP_PERIOD_MSK));
+		ret = regmap_write(st->regmap, AD9910_AXI_REG_RAMP_PERIOD, tmp32);
 		break;
 	case AD9910_AXI_DRG_BURST_COUNT:
 		ret = kstrtou32(buf, 10, &tmp32);
 		if (ret)
 			return ret;
 
+		tmp32 = min(tmp32, FIELD_MAX(AD9910_AXI_REG_BURST_COUNT_MSK));
 		ret = regmap_write(st->regmap, AD9910_AXI_REG_BURST_COUNT, tmp32);
 		break;
 	case AD9910_AXI_DRG_BURST_DELAY:
-		ret = iio_str_to_fixpoint(buf, NANO / 10, &val, &val2);
+		ret = kstrtoudec64(buf, 9, &tmp64);
 		if (ret)
 			return ret;
 
-		tmp64 = (u64)val * NANO + val2;
-		tmp64 = mul_u64_u32_div(tmp64, st->pd_clk_freq_hz, NANO);
-		tmp64 = max(tmp64, AD9910_AXI_BURST_DELAY_OFFSET);
-		tmp64 -= AD9910_AXI_BURST_DELAY_OFFSET;
-		tmp32 = min(tmp64, U32_MAX);
+		ret = regmap_clear_bits(st->regmap, AD9910_AXI_REG_RAMP_CFG,
+					AD9910_AXI_REG_RAMP_CFG_ONE_SHOT_MSK);
+		if (ret)
+			return ret;
+
+		if (!tmp64) {
+			ret = regmap_update_bits(st->regmap, AD9910_AXI_REG_RAMP_CFG,
+						 AD9910_AXI_REG_RAMP_CFG_ONE_SHOT_MSK,
+						 AD9910_AXI_ONE_SHOT_BURST);
+			if (ret)
+				return ret;
+		}
+
+		tmp64 = mul_u64_u64_div_u64(tmp64, st->pd_clk_freq_uhz,
+					    1ULL * NANO * MICROHZ_PER_HZ);
+		tmp32 = min_t(u32, tmp64, U32_MAX);
 		ret = regmap_write(st->regmap, AD9910_AXI_REG_BURST_DELAY, tmp32);
 		break;
 	default:
@@ -230,34 +253,29 @@ static int ad9910_axi_ext_info_get(struct iio_backend *back, uintptr_t private,
 			return ret;
 
 		tmp32++;
-		vals[0] = st->pd_clk_freq_hz / tmp32;
-		vals[1] = div_u64((u64)(st->pd_clk_freq_hz % tmp32) * MICRO, tmp32);
-
-		return iio_format_value(buf, IIO_VAL_INT_PLUS_MICRO, ARRAY_SIZE(vals), vals);
-	case AD9910_AXI_DRG_CONTROL_EN:
+		tmp64 = div_u64(st->pd_clk_freq_uhz, tmp32);
+		iio_val_s64_decompose(tmp64, &vals[0], &vals[1]);
+		return iio_format_value(buf, IIO_VAL_DECIMAL64_MICRO,
+					ARRAY_SIZE(vals), vals);
+	case AD9910_AXI_DRG_RAMP_FREQUENCY:
 		ret = regmap_read(st->regmap, AD9910_AXI_REG_DRG, &tmp32);
 		if (ret)
 			return ret;
 
-		tmp32 = FIELD_GET(AD9910_AXI_REG_DRG_DRCTL_MSK, tmp32);
-		return sysfs_emit(buf, "%u\n", tmp32);
-	case AD9910_AXI_DRG_TOGGLE_EN:
-		ret = regmap_read(st->regmap, AD9910_AXI_REG_DRG, &tmp32);
+		if (!FIELD_GET(AD9910_AXI_REG_DRG_TOGGLE_EN_MSK, tmp32))
+			return sysfs_emit(buf, "0\n");
+
+		ret = regmap_read(st->regmap, AD9910_AXI_REG_RAMP_PERIOD, &tmp32);
 		if (ret)
 			return ret;
 
-		tmp32 = FIELD_GET(AD9910_AXI_REG_DRG_TOGGLE_EN_MSK, tmp32);
-		return sysfs_emit(buf, "%u\n", tmp32);
-	case AD9910_AXI_DRG_RAMP_DELAY:
-		ret = regmap_read(st->regmap, AD9910_AXI_REG_RAMP_DELAY_ALR, &tmp32);
-		if (ret)
-			return ret;
+		if (!tmp32)
+			return -ERANGE;
 
-		tmp64 = (u64)tmp32 + AD9910_AXI_RAMP_DELAY_OFFSET;
-		tmp64 = div_u64(tmp64 * NANO, st->pd_clk_freq_hz);
-		vals[0] = div_u64_rem(tmp64, NANO, &tmp32);
-		vals[1] = tmp32;
-		return iio_format_value(buf, IIO_VAL_INT_PLUS_NANO, ARRAY_SIZE(vals), vals);
+		tmp64 = div_u64(st->pd_clk_freq_uhz, tmp32);
+		iio_val_s64_decompose(tmp64, &vals[0], &vals[1]);
+		return iio_format_value(buf, IIO_VAL_DECIMAL64_MICRO,
+					ARRAY_SIZE(vals), vals);
 	case AD9910_AXI_DRG_BURST_COUNT:
 		ret = regmap_read(st->regmap, AD9910_AXI_REG_BURST_COUNT, &tmp32);
 		if (ret)
@@ -269,11 +287,11 @@ static int ad9910_axi_ext_info_get(struct iio_backend *back, uintptr_t private,
 		if (ret)
 			return ret;
 
-		tmp64 = (u64)tmp32 + AD9910_AXI_BURST_DELAY_OFFSET;
-		tmp64 = div_u64(tmp64 * NANO, st->pd_clk_freq_hz);
-		vals[0] = div_u64_rem(tmp64, NANO, &tmp32);
-		vals[1] = tmp32;
-		return iio_format_value(buf, IIO_VAL_INT_PLUS_NANO, ARRAY_SIZE(vals), vals);
+		tmp64 = mul_u64_u64_div_u64((u64)tmp32 * NANO, MICROHZ_PER_HZ,
+					    st->pd_clk_freq_uhz);
+		iio_val_s64_decompose(tmp64, &vals[0], &vals[1]);
+		return iio_format_value(buf, IIO_VAL_DECIMAL64_NANO,
+					ARRAY_SIZE(vals), vals);
 	default:
 		return -EINVAL;
 	}
@@ -298,9 +316,7 @@ static const struct iio_backend_chan_ext_info ad9910_axi_pp_ext_info[] = {
 };
 
 static const struct iio_backend_chan_ext_info ad9910_axi_drg_ext_info[] = {
-	AD9910_AXI_BACKEND_EXT_INFO("control_en", AD9910_AXI_DRG_CONTROL_EN),
-	AD9910_AXI_BACKEND_EXT_INFO("toggle_en", AD9910_AXI_DRG_TOGGLE_EN),
-	AD9910_AXI_BACKEND_EXT_INFO("ramp_delay", AD9910_AXI_DRG_RAMP_DELAY),
+	AD9910_AXI_BACKEND_EXT_INFO("frequency", AD9910_AXI_DRG_RAMP_FREQUENCY),
 	AD9910_AXI_BACKEND_EXT_INFO("burst_count", AD9910_AXI_DRG_BURST_COUNT),
 	AD9910_AXI_BACKEND_EXT_INFO("burst_delay", AD9910_AXI_DRG_BURST_DELAY),
 	{ }
@@ -310,10 +326,17 @@ static int ad9910_axi_chan_spec(struct iio_backend *back,
 				const struct iio_chan_spec *chan,
 				const struct iio_backend_chan_ext_info **ext_info)
 {
-	if (chan->channel == AD9910_CHANNEL_DRG)
-		*ext_info = ad9910_axi_drg_ext_info;
-	else if (chan->channel == AD9910_CHANNEL_PARALLEL_PORT)
+	switch (chan->channel) {
+	case AD9910_CHANNEL_PARALLEL_AMP ... AD9910_CHANNEL_PARALLEL_POLAR:
 		*ext_info = ad9910_axi_pp_ext_info;
+		break;
+	case AD9910_CHANNEL_DRG:
+		*ext_info = ad9910_axi_drg_ext_info;
+		break;
+	default:
+		*ext_info = NULL;
+		break;
+	}
 
 	return 0;
 }
@@ -324,9 +347,13 @@ static int ad9910_axi_set_sample_rate(struct iio_backend *back,
 {
 	struct ad9910_axi_state *st = iio_backend_get_priv(back);
 
+	guard(mutex)(&st->lock);
+
 	switch (chan) {
-	case AD9910_CHANNEL_PARALLEL_PORT:
-		st->pd_clk_freq_hz = sample_rate;
+	case AD9910_CHANNEL_PHY:
+		if (!sample_rate || sample_rate > HZ_PER_GHZ)
+			return -EINVAL;
+		st->pd_clk_freq_uhz = sample_rate * MICROHZ_PER_HZ >> 2;
 		return 0;
 	default:
 		return -EINVAL;
@@ -337,6 +364,8 @@ static int ad9910_axi_reg_access(struct iio_backend *back, unsigned int reg,
 				 unsigned int writeval, unsigned int *readval)
 {
 	struct ad9910_axi_state *st = iio_backend_get_priv(back);
+
+	guard(mutex)(&st->lock);
 
 	if (readval)
 		return regmap_read(st->regmap, reg, readval);
@@ -353,18 +382,6 @@ static const struct iio_backend_ops ad9910_axi_iio_back_ops = {
 	.set_sample_rate = ad9910_axi_set_sample_rate,
 	.debugfs_reg_access = iio_backend_debugfs_ptr(ad9910_axi_reg_access),
 };
-
-static int ad9910_axi_profile_set(struct iio_backend *back,
-				  unsigned int profile)
-{
-	struct ad9910_axi_state *st = iio_backend_get_priv(back);
-
-	guard(mutex)(&st->lock);
-
-	return regmap_update_bits(st->regmap, AD9910_AXI_REG_PROFILE,
-				  AD9910_AXI_REG_PROFILE_MSK,
-				  FIELD_PREP(AD9910_AXI_REG_PROFILE_MSK, profile));
-}
 
 static int ad9910_axi_io_update(struct iio_backend *back)
 {
@@ -388,23 +405,9 @@ static int ad9910_axi_drg_oper_mode_set(struct iio_backend *back,
 				  FIELD_PREP(AD9910_AXI_REG_DRG_OPER_MODE_MSK, mode));
 }
 
-static int ad9910_axi_powerdown_set(struct iio_backend *back,
-				    unsigned int enable)
-{
-	struct ad9910_axi_state *st = iio_backend_get_priv(back);
-
-	guard(mutex)(&st->lock);
-
-	return regmap_update_bits(st->regmap, AD9910_AXI_REG_RESET,
-				  AD9910_AXI_REG_RESET_PW_DOWN_MSK,
-				  enable ? AD9910_AXI_REG_RESET_PW_DOWN_MSK : 0);
-}
-
 static const struct ad9910_backend_ops ad9910_axi_back_ops = {
-	.profile_set = ad9910_axi_profile_set,
 	.io_update = ad9910_axi_io_update,
 	.drg_oper_mode_set = ad9910_axi_drg_oper_mode_set,
-	.powerdown_set = ad9910_axi_powerdown_set,
 };
 
 static const struct ad9910_backend_info ad9910_axi_back_info = {
@@ -494,17 +497,12 @@ static int ad9910_axi_setup(struct ad9910_axi_state *st)
 {
 	int ret;
 
-	st->pd_clk_freq_hz = AD9910_AXI_PD_CLK_DEFAULT_FREQ_HZ;
+	st->pd_clk_freq_uhz = AD9910_AXI_PD_CLK_DEFAULT_FREQ_UHZ;
 
 	ret = regmap_set_bits(st->regmap, AD9910_AXI_REG_RESET,
 			      AD9910_AXI_REG_RESET_CORE_MSK |
 			      AD9910_AXI_REG_RESET_DEV_MSK |
 			      AD9910_AXI_REG_RESET_IO_MSK);
-	if (ret)
-		return ret;
-
-	ret = regmap_clear_bits(st->regmap, AD9910_AXI_REG_DMA_CFG,
-				AD9910_AXI_REG_DMA_CFG_MSK);
 	if (ret)
 		return ret;
 
